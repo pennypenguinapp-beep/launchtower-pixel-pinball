@@ -54,7 +54,24 @@
     touch-action: none;
     max-width: 100%;
     max-height: calc(100vh - 130px);
+    cursor: pointer;
   }
+  .btn {
+    display: inline-block;
+    font-family: inherit;
+    font-size: 20px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    color: #0d0f14;
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    padding: 12px 34px;
+    cursor: pointer;
+    box-shadow: 0 0 18px rgba(79,209,197,0.45);
+  }
+  .btn:hover { background: #63e0d4; }
+  .btn.small { font-size: 15px; padding: 8px 22px; }
   #msg {
     font-size: 13px;
     color: var(--dim);
@@ -155,6 +172,25 @@
   var ballsEl = document.getElementById('ballsVal');
   var lastTime = 0;
 
+  // ---------- WebAudio (no audio files) ----------
+  var audioCtx = null;
+  function beep(freq, dur, type, vol) {
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      var o = audioCtx.createOscillator();
+      var g = audioCtx.createGain();
+      o.type = type || 'square';
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(vol || 0.06, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+      o.connect(g);
+      g.connect(audioCtx.destination);
+      o.start();
+      o.stop(audioCtx.currentTime + dur);
+    } catch (e) {}
+  }
+
   function updateHUD() {
     scoreEl.textContent = score;
     bestEl.textContent = best;
@@ -187,6 +223,7 @@
     state = 'playing';
     launchCharge = 0;
     launchHeld = false;
+    beep(200, 0.15, 'sawtooth', 0.05);
   }
 
   // ---------- Flippers ----------
@@ -241,6 +278,7 @@
           var impulse = FLIP_IMPULSE * (dir === -1 ? 1 : -1) * 0.4;
           b.vx += impulse * nx * 0.3;
           b.vy -= FLIP_IMPULSE * 0.5;
+          beep(300, 0.05, 'square', 0.04);
         }
       }
       return true;
@@ -326,6 +364,7 @@
         b.vy += ny * 4;
         score += bp.score;
         bp.flash = 1;
+        beep(660, 0.08, 'square', 0.05);
         flashScore();
         updateHUD();
       }
@@ -354,6 +393,7 @@
         b.vy += ny * 3;
         score += s.score;
         s.flash = 1;
+        beep(440, 0.07, 'triangle', 0.05);
         flashScore();
         updateHUD();
       }
@@ -382,10 +422,12 @@
         try { localStorage.setItem('lt_pinball_best', String(best)); } catch (e) {}
         updateHUD();
       }
+      beep(160, 0.3, 'sawtooth', 0.06);
       setMsg('GAME OVER — final score <b>' + score + '</b> · press SPACE or tap to restart');
     } else {
       state = 'ready';
       newBall();
+      beep(320, 0.1, 'triangle', 0.05);
       setMsg('Ball ' + (3 - ballsLeft + 1) + ' of 3 — hold SPACE / tap to charge, release to launch');
     }
   }
@@ -406,7 +448,7 @@
   window.addEventListener('keydown', function (e) {
     if (e.repeat) return;
     keys[e.code] = true;
-    if (e.code === 'Space') {
+    if (e.code === 'Space' || e.code === 'Enter') {
       e.preventDefault();
       if (state === 'ready') {
         launchHeld = true;
@@ -416,8 +458,11 @@
         state = pausedFrom;
       }
     }
-    if (e.code === 'KeyP') {
-      if (state === 'playing' || state === 'ready') {
+    if (e.code === 'KeyR' && state === 'gameOver') {
+      resetGame();
+    }
+    if (e.code === 'KeyP' || e.code === 'Escape') {
+      if (state === 'playing' || (state === 'ready' && ball.active)) {
         pausedFrom = state;
         state = 'paused';
         setMsg('PAUSED — press P to resume');
@@ -474,13 +519,24 @@
       launchHeld = true;
     }
   }
+  // tap = start / resume / play again
+  canvas.addEventListener('touchstart', function (e) {
+    if (state === 'ready' && !ball.active) { launchHeld = true; }
+    else if (state === 'gameOver') { resetGame(); }
+    else if (state === 'paused') { state = pausedFrom; }
+  }, { passive: true });
 
   // Mouse fallback (desktop without keyboard focus)
   canvas.addEventListener('mousedown', function (e) {
     var rect = canvas.getBoundingClientRect();
     var mx = (e.clientX - rect.left) * (W / rect.width);
     var my = (e.clientY - rect.top) * (H / rect.height);
-    if (my < 120 && state === 'ready') launchHeld = true;
+    if (state === 'ready' && !ball.active) {
+      launchHeld = true;
+      return;
+    }
+    if (state === 'gameOver') { resetGame(); return; }
+    if (state === 'paused') { state = pausedFrom; return; }
     if (mx < W / 2) flipLTarget = 1; else flipRTarget = 1;
   });
   canvas.addEventListener('mouseup', function () {
@@ -489,6 +545,19 @@
   });
   canvas.addEventListener('click', function () {
     if (state === 'gameOver') resetGame();
+  });
+
+  // Auto-pause when the tab is hidden
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      if (state === 'playing' || (state === 'ready' && ball.active)) {
+        pausedFrom = state;
+        state = 'paused';
+        setMsg('PAUSED — press P or tap to resume');
+      }
+    } else if (state === 'paused') {
+      state = pausedFrom;
+    }
   });
 
   // ---------- Update ----------
@@ -642,26 +711,69 @@
     }
 
     // overlays
-    if (state === 'gameOver') {
-      ctx.fillStyle = 'rgba(13,15,20,0.75)';
+    if (state === 'ready' && !ball.active) {
+      ctx.fillStyle = 'rgba(13,15,20,0.72)';
       ctx.fillRect(0, 0, W, H);
-      ctx.fillStyle = '#fc8181';
-      ctx.font = 'bold 28px Courier New, monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('GAME OVER', W / 2, H / 2 - 20);
+      ctx.fillStyle = '#4fd1c5';
+      ctx.font = 'bold 34px Courier New, monospace';
+      ctx.fillText('PIXEL PINBALL', W / 2, H / 2 - 90);
       ctx.fillStyle = '#e8ecf4';
-      ctx.font = '16px Courier New, monospace';
-      ctx.fillText('Score: ' + score, W / 2, H / 2 + 10);
+      ctx.font = '15px Courier New, monospace';
+      ctx.fillText('Bounce the ball, hit bumpers, keep it alive', W / 2, H / 2 - 55);
       ctx.fillStyle = '#8b95a8';
       ctx.font = '13px Courier New, monospace';
-      ctx.fillText('Press SPACE or tap to play again', W / 2, H / 2 + 40);
+      ctx.fillText('← → / A D or hold sides to flip · hold SPACE to launch', W / 2, H / 2 - 30);
+      ctx.fillText('P / Esc to pause', W / 2, H / 2 - 10);
+      ctx.fillStyle = '#f6ad55';
+      ctx.font = 'bold 16px Courier New, monospace';
+      ctx.fillText('BEST  ' + best, W / 2, H / 2 + 25);
+      // big PLAY button
+      var bw = 190, bh = 54, bx = W / 2 - bw / 2, by = H / 2 + 55;
+      ctx.fillStyle = '#4fd1c5';
+      ctx.beginPath();
+      ctx.roundRect(bx, by, bw, bh, 10);
+      ctx.fill();
+      ctx.fillStyle = '#0d0f14';
+      ctx.font = 'bold 24px Courier New, monospace';
+      ctx.fillText('▶  PLAY', W / 2, by + 35);
+    } else if (state === 'gameOver') {
+      ctx.fillStyle = 'rgba(13,15,20,0.8)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fc8181';
+      ctx.font = 'bold 30px Courier New, monospace';
+      ctx.fillText('GAME OVER', W / 2, H / 2 - 70);
+      ctx.fillStyle = '#e8ecf4';
+      ctx.font = 'bold 20px Courier New, monospace';
+      ctx.fillText('SCORE  ' + score, W / 2, H / 2 - 30);
+      ctx.fillStyle = '#f6ad55';
+      ctx.font = 'bold 16px Courier New, monospace';
+      ctx.fillText('BEST  ' + best, W / 2, H / 2);
+      if (score >= best && score > 0) {
+        ctx.fillStyle = '#4fd1c5';
+        ctx.font = 'bold 14px Courier New, monospace';
+        ctx.fillText('★ NEW BEST ★', W / 2, H / 2 + 28);
+      }
+      // PLAY AGAIN button
+      var bw2 = 210, bh2 = 54, bx2 = W / 2 - bw2 / 2, by2 = H / 2 + 55;
+      ctx.fillStyle = '#4fd1c5';
+      ctx.beginPath();
+      ctx.roundRect(bx2, by2, bw2, bh2, 10);
+      ctx.fill();
+      ctx.fillStyle = '#0d0f14';
+      ctx.font = 'bold 22px Courier New, monospace';
+      ctx.fillText('▶  PLAY AGAIN', W / 2, by2 + 35);
     } else if (state === 'paused') {
       ctx.fillStyle = 'rgba(13,15,20,0.6)';
       ctx.fillRect(0, 0, W, H);
       ctx.fillStyle = '#4fd1c5';
-      ctx.font = 'bold 24px Courier New, monospace';
+      ctx.font = 'bold 26px Courier New, monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('PAUSED', W / 2, H / 2);
+      ctx.fillText('PAUSED', W / 2, H / 2 - 10);
+      ctx.fillStyle = '#8b95a8';
+      ctx.font = '13px Courier New, monospace';
+      ctx.fillText('P / Esc or tap to resume', W / 2, H / 2 + 20);
     }
   }
 
@@ -684,6 +796,20 @@
     ctx.stroke();
   }
 
+  // ---------- Letterbox scaling ----------
+  function fitCanvas() {
+    var availW = window.innerWidth - 24;
+    var availH = window.innerHeight - 150;
+    var scale = Math.min(availW / W, availH / H);
+    if (scale > 1.6) scale = 1.6;
+    var cssW = Math.floor(W * scale);
+    var cssH = Math.floor(H * scale);
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+  }
+  window.addEventListener('resize', fitCanvas);
+  fitCanvas();
+
   // ---------- Loop ----------
   function loop(ts) {
     if (!lastTime) lastTime = ts;
@@ -697,7 +823,7 @@
   // ---------- Init ----------
   newBall();
   updateHUD();
-  setMsg('Hold SPACE / tap top to charge, release to launch · ← → or hold sides to flip');
+  setMsg('Press PLAY to start · ← → or hold sides to flip · hold SPACE to launch');
   requestAnimationFrame(loop);
 })();
 </script>
