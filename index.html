@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Pixel Pinball — LaunchTower</title>
+<style>
+  :root {
+    --bg: #0d0f14;
+    --panel: #151922;
+    --line: #232a38;
+    --text: #e8ecf4;
+    --dim: #8b95a8;
+    --accent: #4fd1c5;
+    --accent2: #f6ad55;
+    --danger: #fc8181;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Courier New', ui-monospace, monospace;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    padding: 8px;
+    gap: 8px;
+  }
+  #hud {
+    display: flex;
+    gap: 18px;
+    align-items: baseline;
+    font-size: 15px;
+    letter-spacing: 1px;
+  }
+  #hud .label { color: var(--dim); font-size: 11px; display: block; }
+  #hud .val { font-size: 18px; font-weight: bold; }
+  #score .val { color: var(--accent); }
+  #best .val { color: var(--accent2); }
+  #balls .val { color: var(--text); }
+  canvas {
+    background: var(--panel);
+    border: 2px solid var(--line);
+    border-radius: 10px;
+    touch-action: none;
+    max-width: 100%;
+    max-height: calc(100vh - 130px);
+  }
+  #msg {
+    font-size: 13px;
+    color: var(--dim);
+    min-height: 18px;
+    text-align: center;
+  }
+  #msg b { color: var(--accent); }
+  footer {
+    position: fixed;
+    bottom: 4px;
+    left: 0; right: 0;
+    text-align: center;
+    font-size: 11px;
+    color: var(--dim);
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .flash { animation: flash .5s; }
+  @keyframes flash { 0% { color: #fff; } 100% { color: var(--accent); } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hud">
+    <div id="score"><span class="label">SCORE</span><span class="val" id="scoreVal">0</span></div>
+    <div id="best"><span class="label">BEST</span><span class="val" id="bestVal">0</span></div>
+    <div id="balls"><span class="label">BALLS</span><span class="val" id="ballsVal">3</span></div>
+  </div>
+  <canvas id="c"></canvas>
+  <div id="msg">← / → or hold left/right side to flip · SPACE to launch · P to pause</div>
+</div>
+<footer><a href="https://pennypenguinapp-beep.github.io/" target="_blank" rel="noopener">more LaunchTower tools &amp; games →</a></footer>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Canvas setup ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 420, H = 640;           // logical table size
+  var DPR = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  ctx.scale(DPR, DPR);
+
+  // ---------- Physics constants ----------
+  var GRAVITY = 0.16;
+  var FRICTION = 0.999;
+  var MAX_SPEED = 13;
+  var BALL_R = 7;
+  var FLIP_LEN = 52;
+  var FLIP_THICK = 9;
+  var FLIP_SPEED = 0.22;          // radians per frame at 60fps
+  var FLIP_IMPULSE = 8.5;
+  var LAUNCH_SPEED = 11.5;
+
+  // ---------- Table geometry ----------
+  var LEFT_WALL = 14, RIGHT_WALL = W - 14;
+  var TOP_WALL = 14;
+  var FLIP_Y = H - 110;
+  var FLIP_L = { x: 92, y: FLIP_Y };
+  var FLIP_R = { x: W - 92, y: FLIP_Y };
+  var FUNNEL_L = { x: LEFT_WALL + 4, y: FLIP_Y - 120 };
+  var FUNNEL_R = { x: RIGHT_WALL - 4, y: FLIP_Y - 120 };
+  var PLUNGER_X = W - 34;
+  var PLUNGER_TOP = 150;
+  var PLUNGER_BOTTOM = H - 40;
+
+  // Bumpers (circles)
+  var bumpers = [
+    { x: 130, y: 200, r: 24, score: 100, color: '#f6ad55', flash: 0 },
+    { x: W - 130, y: 200, r: 24, score: 100, color: '#4fd1c5', flash: 0 },
+    { x: W / 2, y: 130, r: 26, score: 150, color: '#fc8181', flash: 0 }
+  ];
+
+  // Lanes (top slingshot triangles)
+  var slings = [
+    { ax: 60, ay: 320, bx: 100, by: 380, cx: 60, cy: 380, score: 50, flash: 0 },
+    { ax: W - 60, ay: 320, bx: W - 100, by: 380, cx: W - 60, cy: 380, score: 50, flash: 0 }
+  ];
+
+  // ---------- State ----------
+  var score = 0;
+  var best = 0;
+  try { best = parseInt(localStorage.getItem('lt_pinball_best') || '0', 10) || 0; } catch (e) {}
+  var ballsLeft = 3;
+  var ball = null;
+  var state = 'ready';            // ready | playing | ballLost | gameOver | paused
+  var pausedFrom = 'playing';
+  var flipL = 0, flipR = 0;       // current flipper angles (0 = rest)
+  var flipLTarget = 0, flipRTarget = 0;
+  var launchCharge = 0;
+  var launchHeld = false;
+  var msgEl = document.getElementById('msg');
+  var scoreEl = document.getElementById('scoreVal');
+  var bestEl = document.getElementById('bestVal');
+  var ballsEl = document.getElementById('ballsVal');
+  var lastTime = 0;
+
+  function updateHUD() {
+    scoreEl.textContent = score;
+    bestEl.textContent = best;
+    ballsEl.textContent = ballsLeft;
+  }
+  function setMsg(html) { msgEl.innerHTML = html; }
+  function flashScore() {
+    var s = document.getElementById('score');
+    s.classList.remove('flash');
+    void s.offsetWidth;
+    s.classList.add('flash');
+  }
+
+  // ---------- Ball ----------
+  function newBall() {
+    ball = {
+      x: PLUNGER_X, y: PLUNGER_BOTTOM - 20,
+      vx: 0, vy: 0,
+      active: false,
+      inPlunger: true
+    };
+  }
+
+  function launchBall() {
+    if (!ball || !ball.inPlunger) return;
+    ball.vy = -LAUNCH_SPEED - launchCharge * 4;
+    ball.vx = 0;
+    ball.inPlunger = false;
+    ball.active = true;
+    state = 'playing';
+    launchCharge = 0;
+    launchHeld = false;
+  }
+
+  // ---------- Flippers ----------
+  function flipperAngle(flip, target, dt) {
+    var diff = target - flip;
+    var step = FLIP_SPEED * dt * 60;
+    if (Math.abs(diff) <= step) return target;
+    return flip + Math.sign(diff) * step;
+  }
+
+  function flipperTip(flip, dir) {
+    // dir: -1 for left flipper (tip points right), +1 for right flipper (tip points left)
+    var a = flip * dir;
+    return {
+      x: flip.x + Math.cos(a) * FLIP_LEN * dir,
+      y: flip.y + Math.sin(a) * FLIP_LEN
+    };
+  }
+
+  function flipperRect(flip, dir) {
+    var tip = flipperTip(flip, dir);
+    var x1 = Math.min(flip.x, tip.x), x2 = Math.max(flip.x, tip.x);
+    var y1 = Math.min(flip.y, tip.y) - FLIP_THICK / 2;
+    var y2 = Math.max(flip.y, tip.y) + FLIP_THICK / 2;
+    return { x1: x1, y1: y1, x2: x2, y2: y2, tip: tip };
+  }
+
+  function collideFlipper(b, flip, dir, flipVal) {
+    // Treat flipper as a capsule from pivot to tip
+    var tip = flipperTip(flip, dir);
+    var dx = tip.x - flip.x, dy = tip.y - flip.y;
+    var len2 = dx * dx + dy * dy;
+    var t = ((b.x - flip.x) * dx + (b.y - flip.y) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    var cx = flip.x + dx * t, cy = flip.y + dy * t;
+    var ddx = b.x - cx, ddy = b.y - cy;
+    var dist = Math.sqrt(ddx * ddx + ddy * ddy);
+    var minDist = BALL_R + FLIP_THICK / 2;
+    if (dist < minDist && dist > 0.0001) {
+      var nx = ddx / dist, ny = ddy / dist;
+      // push out
+      b.x = cx + nx * minDist;
+      b.y = cy + ny * minDist;
+      // reflect velocity
+      var dot = b.vx * nx + b.vy * ny;
+      if (dot < 0) {
+        b.vx -= 2 * dot * nx;
+        b.vy -= 2 * dot * ny;
+        // add flipper impulse if flipper is moving (target != current)
+        var moving = Math.abs(flipVal - (dir === -1 ? flipLTarget : flipRTarget)) > 0.01;
+        if (moving) {
+          var impulse = FLIP_IMPULSE * (dir === -1 ? 1 : -1) * 0.4;
+          b.vx += impulse * nx * 0.3;
+          b.vy -= FLIP_IMPULSE * 0.5;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // ---------- Collisions ----------
+  function collideWalls(b) {
+    // Left wall
+    if (b.x - BALL_R < LEFT_WALL) {
+      b.x = LEFT_WALL + BALL_R;
+      if (b.vx < 0) b.vx = -b.vx * 0.85;
+    }
+    // Right wall (plunger lane)
+    if (b.x + BALL_R > RIGHT_WALL) {
+      b.x = RIGHT_WALL - BALL_R;
+      if (b.vx > 0) b.vx = -b.vx * 0.85;
+    }
+    // Top wall
+    if (b.y - BALL_R < TOP_WALL) {
+      b.y = TOP_WALL + BALL_R;
+      if (b.vy < 0) b.vy = -b.vy * 0.85;
+    }
+    // Plunger lane divider (vertical wall from PLUNGER_TOP to bottom, at x = PLUNGER_X - 14)
+    var divX = PLUNGER_X - 14;
+    if (b.x + BALL_R > divX && b.x - BALL_R < divX && b.y > PLUNGER_TOP) {
+      if (b.x > divX) {
+        b.x = divX + BALL_R;
+        if (b.vx > 0) b.vx = -b.vx * 0.85;
+      } else {
+        b.x = divX - BALL_R;
+        if (b.vx < 0) b.vx = -b.vx * 0.85;
+      }
+    }
+    // Funnel walls (diagonal from funnel point to flipper pivot)
+    // Left funnel: from FUNNEL_L to FLIP_L
+    collideSegment(b, FUNNEL_L.x, FUNNEL_L.y, FLIP_L.x, FLIP_L.y);
+    // Right funnel: from FUNNEL_R to FLIP_R
+    collideSegment(b, FUNNEL_R.x, FUNNEL_R.y, FLIP_R.x, FLIP_R.y);
+  }
+
+  function collideSegment(b, x1, y1, x2, y2) {
+    var dx = x2 - x1, dy = y2 - y1;
+    var len2 = dx * dx + dy * dy;
+    if (len2 === 0) return;
+    var t = ((b.x - x1) * dx + (b.y - y1) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    var cx = x1 + dx * t, cy = y1 + dy * t;
+    var ddx = b.x - cx, ddy = b.y - cy;
+    var dist = Math.sqrt(ddx * ddx + ddy * ddy);
+    if (dist < BALL_R && dist > 0.0001) {
+      var nx = ddx / dist, ny = ddy / dist;
+      b.x = cx + nx * BALL_R;
+      b.y = cy + ny * BALL_R;
+      var dot = b.vx * nx + b.vy * ny;
+      if (dot < 0) {
+        b.vx -= 2 * dot * nx;
+        b.vy -= 2 * dot * ny;
+        b.vx *= 0.92;
+        b.vy *= 0.92;
+      }
+    }
+  }
+
+  function collideBumpers(b) {
+    for (var i = 0; i < bumpers.length; i++) {
+      var bp = bumpers[i];
+      var dx = b.x - bp.x, dy = b.y - bp.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      var minDist = BALL_R + bp.r;
+      if (dist < minDist && dist > 0.0001) {
+        var nx = dx / dist, ny = dy / dist;
+        b.x = bp.x + nx * minDist;
+        b.y = bp.y + ny * minDist;
+        var dot = b.vx * nx + b.vy * ny;
+        if (dot < 0) {
+          b.vx -= 2 * dot * nx;
+          b.vy -= 2 * dot * ny;
+        }
+        // bumper kick
+        b.vx += nx * 4;
+        b.vy += ny * 4;
+        score += bp.score;
+        bp.flash = 1;
+        flashScore();
+        updateHUD();
+      }
+    }
+  }
+
+  function collideSlings(b) {
+    for (var i = 0; i < slings.length; i++) {
+      var s = slings[i];
+      // point-in-triangle test
+      if (pointInTri(b.x, b.y, s.ax, s.ay, s.bx, s.by, s.cx, s.cy)) {
+        // push out along normal from centroid
+        var cx = (s.ax + s.bx + s.cx) / 3;
+        var cy = (s.ay + s.by + s.cy) / 3;
+        var dx = b.x - cx, dy = b.y - cy;
+        var dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        var nx = dx / dist, ny = dy / dist;
+        b.x = cx + nx * (BALL_R + 4);
+        b.y = cy + ny * (BALL_R + 4);
+        var dot = b.vx * nx + b.vy * ny;
+        if (dot < 0) {
+          b.vx -= 2 * dot * nx;
+          b.vy -= 2 * dot * ny;
+        }
+        b.vx += nx * 3;
+        b.vy += ny * 3;
+        score += s.score;
+        s.flash = 1;
+        flashScore();
+        updateHUD();
+      }
+    }
+  }
+
+  function pointInTri(px, py, ax, ay, bx, by, cx, cy) {
+    var d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by);
+    var d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy);
+    var d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay);
+    var hasNeg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+    var hasPos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+    return !(hasNeg && hasPos);
+  }
+
+  // ---------- Game flow ----------
+  function loseBall() {
+    if (state === 'paused') return;
+    ballsLeft--;
+    updateHUD();
+    ball = null;
+    if (ballsLeft <= 0) {
+      state = 'gameOver';
+      if (score > best) {
+        best = score;
+        try { localStorage.setItem('lt_pinball_best', String(best)); } catch (e) {}
+        updateHUD();
+      }
+      setMsg('GAME OVER — final score <b>' + score + '</b> · press SPACE or tap to restart');
+    } else {
+      state = 'ready';
+      newBall();
+      setMsg('Ball ' + (3 - ballsLeft + 1) + ' of 3 — hold SPACE / tap to charge, release to launch');
+    }
+  }
+
+  function resetGame() {
+    score = 0;
+    ballsLeft = 3;
+    state = 'ready';
+    newBall();
+    for (var i = 0; i < bumpers.length; i++) bumpers[i].flash = 0;
+    for (var j = 0; j < slings.length; j++) slings[j].flash = 0;
+    updateHUD();
+    setMsg('Hold SPACE / tap to charge, release to launch · ← → or hold sides to flip');
+  }
+
+  // ---------- Input ----------
+  var keys = {};
+  window.addEventListener('keydown', function (e) {
+    if (e.repeat) return;
+    keys[e.code] = true;
+    if (e.code === 'Space') {
+      e.preventDefault();
+      if (state === 'ready') {
+        launchHeld = true;
+      } else if (state === 'gameOver') {
+        resetGame();
+      } else if (state === 'paused') {
+        state = pausedFrom;
+      }
+    }
+    if (e.code === 'KeyP') {
+      if (state === 'playing' || state === 'ready') {
+        pausedFrom = state;
+        state = 'paused';
+        setMsg('PAUSED — press P to resume');
+      } else if (state === 'paused') {
+        state = pausedFrom;
+      }
+    }
+    if (e.code === 'ArrowLeft' || e.code === 'KeyA') flipLTarget = 1;
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') flipRTarget = 1;
+  });
+  window.addEventListener('keyup', function (e) {
+    keys[e.code] = false;
+    if (e.code === 'Space' && launchHeld) {
+      launchBall();
+    }
+    if (e.code === 'ArrowLeft' || e.code === 'KeyA') flipLTarget = 0;
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') flipRTarget = 0;
+  });
+
+  // Touch: left half = left flipper, right half = right flipper, top strip = plunger
+  canvas.addEventListener('touchstart', function (e) {
+    e.preventDefault();
+    handleTouches(e.touches);
+  }, { passive: false });
+  canvas.addEventListener('touchmove', function (e) {
+    e.preventDefault();
+    handleTouches(e.touches);
+  }, { passive: false });
+  canvas.addEventListener('touchend', function (e) {
+    e.preventDefault();
+    handleTouches(e.touches);
+    // if no touches remain, release flippers + launch
+    if (e.touches.length === 0) {
+      flipLTarget = 0;
+      flipRTarget = 0;
+      if (launchHeld) launchBall();
+    }
+  }, { passive: false });
+
+  function handleTouches(touches) {
+    var rect = canvas.getBoundingClientRect();
+    var scaleX = W / rect.width, scaleY = H / rect.height;
+    var leftDown = false, rightDown = false, plungerDown = false;
+    for (var i = 0; i < touches.length; i++) {
+      var tx = (touches[i].clientX - rect.left) * scaleX;
+      var ty = (touches[i].clientY - rect.top) * scaleY;
+      if (ty < 120) plungerDown = true;
+      if (tx < W / 2) leftDown = true;
+      else rightDown = true;
+    }
+    flipLTarget = leftDown ? 1 : 0;
+    flipRTarget = rightDown ? 1 : 0;
+    if (plungerDown && state === 'ready') {
+      launchHeld = true;
+    }
+  }
+
+  // Mouse fallback (desktop without keyboard focus)
+  canvas.addEventListener('mousedown', function (e) {
+    var rect = canvas.getBoundingClientRect();
+    var mx = (e.clientX - rect.left) * (W / rect.width);
+    var my = (e.clientY - rect.top) * (H / rect.height);
+    if (my < 120 && state === 'ready') launchHeld = true;
+    if (mx < W / 2) flipLTarget = 1; else flipRTarget = 1;
+  });
+  canvas.addEventListener('mouseup', function () {
+    flipLTarget = 0; flipRTarget = 0;
+    if (launchHeld) launchBall();
+  });
+  canvas.addEventListener('click', function () {
+    if (state === 'gameOver') resetGame();
+  });
+
+  // ---------- Update ----------
+  function update(dt) {
+    // flippers always animate
+    flipL = flipperAngle(flipL, flipLTarget, dt);
+    flipR = flipperAngle(flipR, flipRTarget, dt);
+
+    // bumper/sling flash decay
+    for (var i = 0; i < bumpers.length; i++) bumpers[i].flash *= 0.92;
+    for (var j = 0; j < slings.length; j++) slings[j].flash *= 0.92;
+
+    if (state === 'ready' && launchHeld) {
+      launchCharge = Math.min(1, launchCharge + dt * 1.2);
+    }
+
+    if (!ball || !ball.active) return;
+
+    // physics
+    ball.vy += GRAVITY * dt * 60;
+    ball.vx *= Math.pow(FRICTION, dt * 60);
+    ball.vy *= Math.pow(FRICTION, dt * 60);
+
+    // clamp speed
+    var sp = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+    if (sp > MAX_SPEED) {
+      ball.vx = ball.vx / sp * MAX_SPEED;
+      ball.vy = ball.vy / sp * MAX_SPEED;
+    }
+
+    ball.x += ball.vx * dt * 60;
+    ball.y += ball.vy * dt * 60;
+
+    collideWalls(ball);
+    collideBumpers(ball);
+    collideSlings(ball);
+    collideFlipper(ball, FLIP_L, -1, flipL);
+    collideFlipper(ball, FLIP_R, 1, flipR);
+
+    // ball lost: below bottom
+    if (ball.y - BALL_R > H + 20) {
+      loseBall();
+    }
+  }
+
+  // ---------- Render ----------
+  function drawTable() {
+    ctx.clearRect(0, 0, W, H);
+
+    // background gradient
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#1a2030');
+    g.addColorStop(1, '#0f131c');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // playfield border
+    ctx.strokeStyle = '#2a3345';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(LEFT_WALL, TOP_WALL, RIGHT_WALL - LEFT_WALL, H - TOP_WALL - 10);
+
+    // plunger lane divider
+    ctx.strokeStyle = '#3a4560';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(PLUNGER_X - 14, PLUNGER_TOP);
+    ctx.lineTo(PLUNGER_X - 14, H - 10);
+    ctx.stroke();
+
+    // funnel walls
+    ctx.strokeStyle = '#3a4560';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(FUNNEL_L.x, FUNNEL_L.y);
+    ctx.lineTo(FLIP_L.x, FLIP_L.y);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(FUNNEL_R.x, FUNNEL_R.y);
+    ctx.lineTo(FLIP_R.x, FLIP_R.y);
+    ctx.stroke();
+
+    // slingshot triangles
+    for (var i = 0; i < slings.length; i++) {
+      var s = slings[i];
+      ctx.fillStyle = s.flash > 0.1 ? 'rgba(246,173,85,' + (0.3 + s.flash * 0.7) + ')' : 'rgba(246,173,85,0.25)';
+      ctx.strokeStyle = '#f6ad55';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(s.ax, s.ay);
+      ctx.lineTo(s.bx, s.by);
+      ctx.lineTo(s.cx, s.cy);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    // bumpers
+    for (var b = 0; b < bumpers.length; b++) {
+      var bp = bumpers[b];
+      var glow = bp.flash > 0.1 ? bp.flash : 0;
+      ctx.beginPath();
+      ctx.arc(bp.x, bp.y, bp.r, 0, Math.PI * 2);
+      ctx.fillStyle = bp.color;
+      ctx.globalAlpha = 0.35 + glow * 0.65;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = bp.color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // inner dot
+      ctx.beginPath();
+      ctx.arc(bp.x, bp.y, bp.r * 0.4, 0, Math.PI * 2);
+      ctx.fillStyle = '#fff';
+      ctx.globalAlpha = 0.4 + glow * 0.6;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // flippers
+    drawFlipper(FLIP_L, -1, flipL);
+    drawFlipper(FLIP_R, 1, flipR);
+
+    // plunger
+    if (state === 'ready' || (ball && ball.inPlunger)) {
+      var py = PLUNGER_BOTTOM - 20 - launchCharge * 40;
+      ctx.fillStyle = '#4fd1c5';
+      ctx.fillRect(PLUNGER_X - 8, py, 16, PLUNGER_BOTTOM - py);
+      // spring
+      ctx.strokeStyle = '#8b95a8';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (var sy = py + 4; sy < PLUNGER_BOTTOM; sy += 6) {
+        ctx.moveTo(PLUNGER_X - 6, sy);
+        ctx.lineTo(PLUNGER_X + 6, sy + 3);
+      }
+      ctx.stroke();
+    }
+
+    // ball
+    if (ball) {
+      ctx.beginPath();
+      ctx.arc(ball.x, ball.y, BALL_R, 0, Math.PI * 2);
+      var bg = ctx.createRadialGradient(ball.x - 2, ball.y - 2, 1, ball.x, ball.y, BALL_R);
+      bg.addColorStop(0, '#ffffff');
+      bg.addColorStop(1, '#a0aec0');
+      ctx.fillStyle = bg;
+      ctx.fill();
+      ctx.strokeStyle = '#718096';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    // overlays
+    if (state === 'gameOver') {
+      ctx.fillStyle = 'rgba(13,15,20,0.75)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#fc8181';
+      ctx.font = 'bold 28px Courier New, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('GAME OVER', W / 2, H / 2 - 20);
+      ctx.fillStyle = '#e8ecf4';
+      ctx.font = '16px Courier New, monospace';
+      ctx.fillText('Score: ' + score, W / 2, H / 2 + 10);
+      ctx.fillStyle = '#8b95a8';
+      ctx.font = '13px Courier New, monospace';
+      ctx.fillText('Press SPACE or tap to play again', W / 2, H / 2 + 40);
+    } else if (state === 'paused') {
+      ctx.fillStyle = 'rgba(13,15,20,0.6)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#4fd1c5';
+      ctx.font = 'bold 24px Courier New, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('PAUSED', W / 2, H / 2);
+    }
+  }
+
+  function drawFlipper(flip, dir, angle) {
+    var tip = flipperTip(flip, dir);
+    ctx.strokeStyle = '#4fd1c5';
+    ctx.lineWidth = FLIP_THICK;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(flip.x, flip.y);
+    ctx.lineTo(tip.x, tip.y);
+    ctx.stroke();
+    // pivot
+    ctx.beginPath();
+    ctx.arc(flip.x, flip.y, FLIP_THICK / 2 + 2, 0, Math.PI * 2);
+    ctx.fillStyle = '#2d3748';
+    ctx.fill();
+    ctx.strokeStyle = '#4fd1c5';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // ---------- Loop ----------
+  function loop(ts) {
+    if (!lastTime) lastTime = ts;
+    var dt = Math.min((ts - lastTime) / 1000, 0.05);
+    lastTime = ts;
+    if (state !== 'paused') update(dt);
+    drawTable();
+    requestAnimationFrame(loop);
+  }
+
+  // ---------- Init ----------
+  newBall();
+  updateHUD();
+  setMsg('Hold SPACE / tap top to charge, release to launch · ← → or hold sides to flip');
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
